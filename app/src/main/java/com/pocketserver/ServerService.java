@@ -21,7 +21,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.List;
 
 public class ServerService extends Service {
@@ -39,6 +43,7 @@ public class ServerService extends Service {
     private static final int FCGI_PORT = 9100;
 
     private final Object setupLock = new Object();
+    private volatile boolean dbExternal = false;
 
     private Process dbProc;
     private Process phpProc;
@@ -252,8 +257,27 @@ public class ServerService extends Service {
                 return;
             }
 
+            boolean https = sp.getBoolean("https_on", false);
+            int httpsPort = sp.getInt("https_port", 8443);
+            File certFile = new File(etc, "ssl/cert.pem");
+            File keyFile = new File(etc, "ssl/key.pem");
+            if (https) {
+                File modSsl = new File(modDir, "mod_openssl.so");
+                if (!modSsl.exists()) {
+                    log("HTTPS needs " + modSsl.getAbsolutePath() + ". HTTPS is turned off for this run.");
+                    https = false;
+                } else if (httpsPort == webPort || !portFree(httpsPort)) {
+                    failWeb("HTTPS port " + httpsPort + " is already in use. Change it and press Start again.");
+                    return;
+                } else if (!ensureCertificate(sp, certFile, keyFile)) {
+                    log("Could not create the HTTPS certificate. HTTPS is turned off for this run.");
+                    https = false;
+                }
+            }
+
             writePhpIni(new File(etc, "php.ini"), sock, dbPort, base, tmp);
-            writeLighttpdConf(new File(etc, "lighttpd.conf"), docRoot, webPort, FCGI_PORT, base);
+            writeLighttpdConf(new File(etc, "lighttpd.conf"), docRoot, webPort, FCGI_PORT, base,
+                    https, httpsPort, certFile, keyFile);
 
             if (php.exists()) {
                 selfTestPhp(php, base, tmp);
@@ -280,10 +304,108 @@ public class ServerService extends Service {
             webProc = p;
             log("Web server starting on port " + webPort);
             log("Open http://localhost:" + webPort + "/");
+            if (https) {
+                log("Open https://localhost:" + httpsPort + "/ (self-signed certificate, accept the browser warning)");
+            }
             watchWeb(p);
             updateNotification();
         } catch (Exception e) {
             failWeb("Web error: " + e);
+        }
+    }
+
+    private boolean ensureCertificate(SharedPreferences sp, File cert, File key) {
+        try {
+            List<String> ips = new ArrayList<String>();
+            ips.add("127.0.0.1");
+            try {
+                Enumeration<NetworkInterface> nis = NetworkInterface.getNetworkInterfaces();
+                while (nis != null && nis.hasMoreElements()) {
+                    NetworkInterface ni = nis.nextElement();
+                    Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress a = addrs.nextElement();
+                        if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                            ips.add(a.getHostAddress());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log("Could not list network addresses: " + e);
+            }
+            String stored = "," + sp.getString("ssl_ips", "") + ",";
+            boolean covered = cert.exists() && key.exists();
+            for (int i = 0; i < ips.size() && covered; i++) {
+                if (!stored.contains("," + ips.get(i) + ",")) {
+                    covered = false;
+                }
+            }
+            if (covered) {
+                return true;
+            }
+            StringBuilder joined = new StringBuilder();
+            for (int i = 0; i < ips.size(); i++) {
+                if (i > 0) {
+                    joined.append(",");
+                }
+                joined.append(ips.get(i));
+            }
+            List<String> names = new ArrayList<String>();
+            names.add("localhost");
+            CertGen.generate(cert, key, names, ips);
+            sp.edit().putString("ssl_ips", joined.toString()).commit();
+            log("Created self-signed HTTPS certificate for localhost and " + joined);
+            return true;
+        } catch (Exception e) {
+            log("Certificate error: " + e);
+            return false;
+        }
+    }
+
+    private File chooseDataDir(SharedPreferences sp) {
+        File data = new File(sp.getString("db_dir", Installer.defaultDbDir(this).getAbsolutePath()));
+        File docRoot = new File(sp.getString("doc_root",
+                new File(Environment.getExternalStorageDirectory(), "PocketServer/www").getAbsolutePath()));
+        if (isInside(data, docRoot)) {
+            failDb("The database folder must not be inside the web document root (its files could be downloaded). Choose a different database folder.");
+            return null;
+        }
+        if (isInside(docRoot, data)) {
+            failDb("The database folder must not contain the web document root. Choose a different database folder.");
+            return null;
+        }
+        if (!usableDir(data)) {
+            File fallback = new File(getFilesDir(), "data");
+            log("Cannot write to database folder " + data.getAbsolutePath() + " (allow storage permission). Using " + fallback.getAbsolutePath());
+            fallback.mkdirs();
+            data = fallback;
+        }
+        log("Database folder: " + data.getAbsolutePath());
+        return data;
+    }
+
+    private boolean isInside(File child, File parent) {
+        try {
+            String c = child.getCanonicalPath();
+            String p = parent.getCanonicalPath();
+            return c.equals(p) || c.startsWith(p + "/");
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private boolean usableDir(File dir) {
+        try {
+            if (!dir.exists() && !dir.mkdirs()) {
+                return false;
+            }
+            File t = new File(dir, ".pocketserver_write_test");
+            FileWriter w = new FileWriter(t);
+            w.write("ok");
+            w.close();
+            return t.delete();
+        } catch (IOException e) {
+            return false;
         }
     }
 
@@ -295,11 +417,14 @@ public class ServerService extends Service {
 
             File base = Installer.baseDir(this);
             File bin = new File(base, "bin");
-            File data = new File(getFilesDir(), "data");
             File tmp = new File(getCacheDir(), "tmp");
             File sock = new File(getFilesDir(), "mysql.sock");
-            data.mkdirs();
             tmp.mkdirs();
+            File data = chooseDataDir(sp);
+            if (data == null) {
+                return;
+            }
+            dbExternal = !data.getAbsolutePath().startsWith(getFilesDir().getAbsolutePath());
 
             File mariadbd = new File(bin, "mariadbd");
             if (!mariadbd.exists()) {
@@ -359,6 +484,9 @@ public class ServerService extends Service {
                 }
                 if (dbProc == p) {
                     log("MariaDB exited unexpectedly.");
+                    if (dbExternal) {
+                        log("The database folder is on shared storage. If it keeps failing, press App storage under Database folder and start again.");
+                    }
                     stopDb();
                     finishIfIdle();
                 }
@@ -443,6 +571,10 @@ public class ServerService extends Service {
         }
         if (plugins.exists()) {
             cmd.add("--plugin-dir=" + plugins.getAbsolutePath());
+        }
+        if (!data.getAbsolutePath().startsWith(getFilesDir().getAbsolutePath())) {
+            cmd.add("--loose-innodb-flush-method=fsync");
+            cmd.add("--loose-innodb-use-native-aio=0");
         }
         return cmd;
     }
@@ -731,9 +863,10 @@ public class ServerService extends Service {
         writeFile(f, s.toString());
     }
 
-    private void writeLighttpdConf(File f, File docRoot, int port, int fcgiPort, File base) throws IOException {
+    private void writeLighttpdConf(File f, File docRoot, int port, int fcgiPort, File base,
+            boolean https, int httpsPort, File cert, File key) throws IOException {
         StringBuilder s = new StringBuilder();
-        s.append("server.modules = ( \"mod_fastcgi\", \"mod_dirlisting\" )\n");
+        s.append("server.modules = ( " + (https ? "\"mod_openssl\", " : "") + "\"mod_fastcgi\", \"mod_dirlisting\" )\n");
         s.append("server.document-root = \"" + docRoot.getAbsolutePath() + "\"\n");
         s.append("server.port = " + port + "\n");
         s.append("index-file.names = ( \"index.php\", \"index.html\" )\n");
@@ -763,6 +896,13 @@ public class ServerService extends Service {
         s.append("  \"\" => \"application/octet-stream\"\n");
         s.append(")\n");
         s.append("fastcgi.server = ( \".php\" => ( ( \"host\" => \"127.0.0.1\", \"port\" => " + fcgiPort + " ) ) )\n");
+        if (https) {
+            s.append("$SERVER[\"socket\"] == \":" + httpsPort + "\" {\n");
+            s.append("  ssl.engine = \"enable\"\n");
+            s.append("  ssl.pemfile = \"" + cert.getAbsolutePath() + "\"\n");
+            s.append("  ssl.privkey = \"" + key.getAbsolutePath() + "\"\n");
+            s.append("}\n");
+        }
         writeFile(f, s.toString());
     }
 
