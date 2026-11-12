@@ -8,7 +8,6 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -20,6 +19,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -850,8 +850,18 @@ public class MainActivity extends Activity {
     }
 
     private int textColor() {
-        int mode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
-        return mode == Configuration.UI_MODE_NIGHT_YES ? 0xFFEEEEEE : 0xFF000000;
+        try {
+            TypedValue tv = new TypedValue();
+            if (getTheme().resolveAttribute(android.R.attr.textColorPrimary, tv, true)) {
+                if (tv.resourceId != 0) {
+                    return getResources().getColorStateList(tv.resourceId).getDefaultColor();
+                }
+                return tv.data;
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return 0xFF000000;
     }
 
     private void setStatus(TextView tv, String name, boolean on) {
