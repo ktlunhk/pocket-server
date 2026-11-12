@@ -3,6 +3,7 @@ package com.pocketserver;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.AssetManager;
+import android.os.Environment;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -11,6 +12,14 @@ import java.io.InputStream;
 import java.io.OutputStream;
 
 public class Installer {
+
+    public static File defaultDbDir(Context c) {
+        File old = new File(c.getFilesDir(), "data");
+        if (new File(old, "mysql").exists()) {
+            return old;
+        }
+        return new File(Environment.getExternalStorageDirectory(), "PocketServer/data");
+    }
 
     public static File baseDir(Context c) {
         return new File(c.getFilesDir(), "server");
